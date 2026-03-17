@@ -4,7 +4,7 @@ Notable features:
 - byte-level: vocab_size=256, no tokenizer needed
 - selective state space model (S6) with input-dependent dynamics
 - O(1) inference memory per layer (no KV cache growth)
-- parallel scan in pure PyTorch (Triton backend planned)
+- Triton selective scan kernel (pure PyTorch fallback available)
 - depth is the only dial (same philosophy as nanochat GPT)
 """
 
@@ -17,6 +17,12 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
+
+try:
+    from nanochat.triton_scan import selective_scan_triton
+    HAS_TRITON_SCAN = True
+except ImportError:
+    HAS_TRITON_SCAN = False
 
 
 # ─── Config ─────────────────────────────────────────────────────────────────
@@ -224,9 +230,10 @@ class Mamba1Mixer(nn.Module):
         dt, B_ssm, C = x_dbl.split([dt_rank, d_state, d_state], dim=-1)
         dt = F.softplus(self.dt_proj(dt))   # (B, L, D_inner)
 
-        # SSM scan
+        # SSM scan — Triton kernel on GPU, pure PyTorch fallback on CPU
         A = -torch.exp(self.A_log.float())  # (D_inner, N) — always negative
-        y = selective_scan(x, dt, A, B_ssm, C, self.D.float())
+        scan_fn = selective_scan_triton if (HAS_TRITON_SCAN and x.is_cuda) else selective_scan
+        y = scan_fn(x, dt, A, B_ssm, C, self.D.float())
 
         # Gate with SiLU(z) and project back to model dim
         return self.out_proj(y * F.silu(z))
