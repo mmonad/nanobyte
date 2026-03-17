@@ -3,7 +3,7 @@ name = "nanochat"
 version = "0.1.0"
 description = "the minimal full-stack ChatGPT clone"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = [
     "datasets>=4.0.0",
     "fastapi>=0.117.1",
@@ -18,7 +18,7 @@ dependencies = [
     "tabulate>=0.9.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
-    "torch==2.9.1",
+    "torch>=2.9.1",
     "transformers>=4.57.3",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
@@ -39,11 +39,44 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
-# torch from CUDA 13.0 index
+# target torch to CPU, CUDA 13.0 (Blackwell/DGX Spark), or ROCm 7.2 (RDNA4)
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu130", extra = "gpu" },
+    { url = "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torch-2.9.1%2Brocm7.2.0.lw.git7e1940d4-cp313-cp313-linux_x86_64.whl", extra = "rocm" },
+]
+triton = [
+    { url = "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.5.1%2Brocm7.2.0.gita272dfa8-cp313-cp313-linux_x86_64.whl", extra = "rocm" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
+
+[project.optional-dependencies]
+cpu = [
+    "torch==2.9.1",
+]
+gpu = [
+    "torch>=2.9.1",
+]
+rocm = [
+    "torch==2.9.1",
+    "triton==3.5.1",
+]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "gpu" },
+        { extra = "rocm" },
+    ],
+]
