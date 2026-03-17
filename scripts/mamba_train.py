@@ -37,7 +37,7 @@ parser.add_argument("--weight-decay", type=float, default=0.1, help="weight deca
 parser.add_argument("--warmup-steps", type=int, default=20, help="LR warmup steps")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="fraction of training for LR warmdown")
 # Data
-parser.add_argument("--data", type=str, default="", help="path to text file for training (empty=synthetic)")
+parser.add_argument("--data", type=str, default="", help="path to text file for training (empty=ClimbMix)")
 # Display
 parser.add_argument("--log-every", type=int, default=10, help="print every N steps")
 parser.add_argument("--val-every", type=int, default=50, help="validate every N steps (-1=disable)")
@@ -59,36 +59,38 @@ else:
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # ─── Data ───────────────────────────────────────────────────────────────────
+# By default, loads ClimbMix-400B parquet shards (same dataset as nanochat GPT)
+# and converts text to raw bytes. Use --data for a plain text file instead.
 
-def load_byte_data(path, device):
+def load_climbmix_bytes(split, max_bytes, device):
+    """Load ClimbMix parquet data as a flat byte tensor."""
+    import numpy as np
+    from nanochat.dataset import list_parquet_files, parquets_iter_batched
+    list_parquet_files(warn_on_legacy=True)  # warn if ClimbMix not found
+    chunks = []
+    total = 0
+    for texts in parquets_iter_batched(split):
+        for text in texts:
+            b = text.encode('utf-8')
+            chunks.append(b)
+            total += len(b)
+            if total >= max_bytes:
+                break
+        if total >= max_bytes:
+            break
+    raw = b''.join(chunks)[:max_bytes]
+    arr = np.frombuffer(raw, dtype=np.uint8).astype(np.int64)
+    print0(f"  Loaded {len(arr):,} bytes from ClimbMix ({split})")
+    return torch.from_numpy(arr).to(device)
+
+def load_file_bytes(path, device):
     """Load a text file as a flat byte tensor."""
+    import numpy as np
     with open(path, 'rb') as f:
         data = f.read()
-    return torch.tensor(list(data), dtype=torch.long, device=device)
-
-def generate_synthetic_data(n_bytes, device):
-    """Generate synthetic byte data for smoke-testing the training loop."""
-    text = ("The quick brown fox jumps over the lazy dog. "
-            "Pack my box with five dozen liquor jugs. "
-            "How vexingly quick daft zebras jump! "
-            "Sphinx of black quartz, judge my vow. ") * (n_bytes // 160 + 1)
-    data = list(text.encode('utf-8'))[:n_bytes]
-    return torch.tensor(data, dtype=torch.long, device=device)
-
-total_bytes_needed = args.device_batch_size * args.max_seq_len * (args.num_iterations + 100)
-total_bytes_needed = max(total_bytes_needed, 1_000_000)
-
-if args.data:
-    print0(f"Loading data from {args.data}")
-    all_bytes = load_byte_data(args.data, device)
-else:
-    print0(f"Using synthetic data ({total_bytes_needed:,} bytes)")
-    all_bytes = generate_synthetic_data(total_bytes_needed, device)
-
-split = int(len(all_bytes) * 0.9)
-train_bytes = all_bytes[:split]
-val_bytes = all_bytes[split:]
-print0(f"Data: {len(train_bytes):,} train bytes, {len(val_bytes):,} val bytes")
+    arr = np.frombuffer(data, dtype=np.uint8).astype(np.int64)
+    print0(f"  Loaded {len(arr):,} bytes from {path}")
+    return torch.from_numpy(arr).to(device)
 
 def get_batch(split_data, batch_size, seq_len):
     """Sample a random batch of byte sequences."""
@@ -96,6 +98,27 @@ def get_batch(split_data, batch_size, seq_len):
     x = torch.stack([split_data[i:i+seq_len] for i in ix])
     y = torch.stack([split_data[i+1:i+seq_len+1] for i in ix])
     return x, y
+
+# Load data: default is ClimbMix, --data overrides with a text file
+# Load ~10x more bytes than training consumes to ensure variety in random sampling
+total_batch_size = args.total_batch_size
+if total_batch_size == -1:
+    total_batch_size = args.device_batch_size * args.max_seq_len
+train_bytes_target = total_batch_size * args.num_iterations * 10
+train_bytes_target = min(max(train_bytes_target, 10_000_000), 200_000_000)  # 10MB–200MB
+val_bytes_target = min(max(train_bytes_target // 10, 1_000_000), 20_000_000)
+
+if args.data:
+    print0(f"Loading data from {args.data}")
+    all_bytes = load_file_bytes(args.data, device)
+    split = int(len(all_bytes) * 0.9)
+    train_bytes, val_bytes = all_bytes[:split], all_bytes[split:]
+else:
+    print0(f"Loading ClimbMix data...")
+    train_bytes = load_climbmix_bytes("train", train_bytes_target, device)
+    val_bytes = load_climbmix_bytes("val", val_bytes_target, device)
+
+print0(f"Data: {len(train_bytes):,} train bytes, {len(val_bytes):,} val bytes")
 
 # ─── Model ──────────────────────────────────────────────────────────────────
 
@@ -138,9 +161,7 @@ model = torch.compile(model, dynamic=False)
 
 # ─── Batch / grad accum ────────────────────────────────────────────────────
 
-total_batch_size = args.total_batch_size
-if total_batch_size == -1:
-    total_batch_size = args.device_batch_size * args.max_seq_len
+# total_batch_size already computed above in data loading section
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len
 assert total_batch_size % tokens_per_fwdbwd == 0
 grad_accum_steps = total_batch_size // tokens_per_fwdbwd
