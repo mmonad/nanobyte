@@ -269,6 +269,22 @@ def get_peak_flops(device_name: str) -> float:
     for patterns, flops in _PEAK_FLOPS_TABLE:
         if all(p in name for p in patterns):
             return flops
+
+    # AMD RDNA4: PyTorch reports "AMD Radeon Graphics" without the product name.
+    # Use gcnArchName from device properties to identify the GPU.
+    # Navi 48 (gfx1201): 64 CUs, 128 AI accelerators (2nd gen WMMA)
+    #   BF16 matrix dense: 191.4 TFLOPS @ 2920 MHz (AI PRO R9700)
+    #   PyTorch reports WGPs as multi_processor_count (32 WGPs = 64 CUs)
+    #   Source: AMD Radeon AI PRO R9700 datasheet
+    if device_name and torch.cuda.is_available():
+        try:
+            props = torch.cuda.get_device_properties(0)
+            gcn = getattr(props, 'gcnArchName', '')
+            if gcn == 'gfx1201':  # Navi 48 (RDNA4)
+                return 191.4e12
+        except Exception:
+            pass
+
     if "data center gpu max 1550" in name:
         # Ponte Vecchio (PVC) - dynamic based on compute units
         max_comp_units = torch.xpu.get_device_properties("xpu").max_compute_units
