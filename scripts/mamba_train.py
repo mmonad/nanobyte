@@ -27,7 +27,7 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="n_embd = depth
 parser.add_argument("--max-seq-len", type=int, default=1024, help="byte sequence length")
 # Training
 parser.add_argument("--num-iterations", type=int, default=500, help="number of optimization steps")
-parser.add_argument("--device-batch-size", type=int, default=8, help="per-device batch size (sequences)")
+parser.add_argument("--device-batch-size", type=int, default=12, help="per-device batch size (sequences)")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in bytes (-1=device_batch_size*max_seq_len)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="Muon LR for projection weights")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="AdamW LR for embedding")

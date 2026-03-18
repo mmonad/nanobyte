@@ -31,7 +31,7 @@ except ImportError:
 class Mamba1Config:
     sequence_len: int = 8192  # byte-level needs longer sequences (~4x token-level)
     vocab_size: int = 256     # raw UTF-8 bytes
-    n_layer: int = 24
+    n_layer: int = 24          # ~2x GPT layers (Mamba layers are ~half the FLOPs each)
     n_embd: int = 768         # d_model
     expand: int = 2           # d_inner = expand * n_embd
     d_state: int = 16         # SSM state dimension (N in the paper)
