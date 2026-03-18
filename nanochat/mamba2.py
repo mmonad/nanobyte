@@ -21,6 +21,14 @@ import torch.nn.functional as F
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
+try:
+    from fla.ops.simple_gla import chunk_simple_gla
+    # FLA Triton kernels fail to compile on RDNA4 (gfx1201) due to ROCm Triton backend limitations.
+    # Forward pass works but backward pass compilation crashes. Use pure PyTorch fallback on ROCm.
+    HAS_FLA = not (torch.cuda.is_available() and getattr(torch.version, "hip", None) is not None)
+except ImportError:
+    HAS_FLA = False
+
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -161,10 +169,10 @@ def ssd_forward(X, A, B, C, chunk_size, initial_states=None):
 
     # ── Step 4: State → output conversion (C-factors, left term) ──
     state_decay_out = torch.exp(A_cumsum)  # (B, H, nc, Q)
-    Y_off = torch.einsum("bclhn,bchpn,bhcl->bclhp", C, states, state_decay_out)
+    Y_off = torch.einsum("bclhn,bchpn,bhcl->bclhp", C.float(), states, state_decay_out)
 
     # Combine intra-chunk and inter-chunk outputs
-    Y = (Y_diag + Y_off).reshape(batch, seqlen, nheads, headdim)
+    Y = (Y_diag + Y_off).to(X.dtype).reshape(batch, seqlen, nheads, headdim)
     return Y, final_state
 
 
@@ -286,13 +294,24 @@ class Mamba2Mixer(nn.Module):
         B = B.reshape(batch, seqlen, self.ngroups, self.d_state)  # (B, L, G, N)
         C = C.reshape(batch, seqlen, self.ngroups, self.d_state)  # (B, L, G, N)
 
-        # ── SSD core: x*dt is the discretized input, A*dt is the discretized decay ──
-        y, _ = ssd_forward(
-            x * dt.unsqueeze(-1),           # (B, L, H, P) — discretized input
-            A.unsqueeze(0).unsqueeze(0) * dt,  # (B, L, H) — discretized decay (log-space)
-            B, C,
-            chunk_size=self.chunk_size,
-        )
+        # Discretize: input *= dt, decay = A * dt (log-space)
+        x_dt = x * dt.unsqueeze(-1)                   # (B, L, H, P)
+        g = A.unsqueeze(0).unsqueeze(0) * dt           # (B, L, H) — log-space decay
+
+        # Expand B,C groups to match heads for FLA kernel
+        if self.ngroups < self.nheads:
+            heads_per_group = self.nheads // self.ngroups
+            B = B.unsqueeze(3).expand(*B.shape[:2], self.ngroups, heads_per_group, self.d_state)
+            B = B.reshape(batch, seqlen, self.nheads, self.d_state)
+            C = C.unsqueeze(3).expand(*C.shape[:2], self.ngroups, heads_per_group, self.d_state)
+            C = C.reshape(batch, seqlen, self.nheads, self.d_state)
+
+        # ── SSD core ──
+        # FLA mapping: SSD(X, A, B, C) → simple_gla(q=C, k=B, v=X, g=A)
+        if HAS_FLA and x.is_cuda:
+            y, _ = chunk_simple_gla(q=C, k=B, v=x_dt, g=g, scale=1.0)
+        else:
+            y, _ = ssd_forward(x_dt, g, B, C, chunk_size=self.chunk_size)
 
         # ── D skip connection ──
         y = y + x * self.D.unsqueeze(-1)

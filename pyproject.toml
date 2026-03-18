@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "datasets>=4.0.0",
+    "einops>=0.8.0",
     "fastapi>=0.117.1",
+    "flash-linear-attention",
     "ipykernel>=7.1.0",
     "matplotlib>=3.10.8",
     "psutil>=7.1.0",
@@ -41,6 +43,7 @@ python_functions = ["test_*"]
 
 # target torch to CPU, CUDA 13.0 (Blackwell/DGX Spark), or ROCm 7.2 (RDNA4)
 [tool.uv.sources]
+flash-linear-attention = { git = "https://github.com/fla-org/flash-linear-attention.git" }
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu130", extra = "gpu" },
