@@ -1,8 +1,8 @@
 """
-Train Mamba1 byte-level model. From root directory:
+Train Mamba2 byte-level model (SSD algorithm). From root directory:
 
-    python -m scripts.mamba_train
-    python -m scripts.mamba_train --depth=4 --num-iterations=100  # quick test
+    python -m scripts.mamba2_train
+    python -m scripts.mamba2_train --depth=4 --num-iterations=100  # quick test
 """
 
 import os
@@ -14,17 +14,20 @@ import argparse
 
 import torch
 
-from nanochat.mamba1 import Mamba1, Mamba1Config
+from nanochat.mamba2 import Mamba2, Mamba2Config
 from nanochat.common import compute_init, compute_cleanup, print0, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
 
-parser = argparse.ArgumentParser(description="Pretrain Mamba1 byte-level model")
+parser = argparse.ArgumentParser(description="Pretrain Mamba2 byte-level model")
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty=autodetect)")
 # Model
-parser.add_argument("--depth", type=int, default=12, help="number of Mamba layers")
+parser.add_argument("--depth", type=int, default=12, help="number of Mamba2 layers")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="n_embd = depth * aspect_ratio")
 parser.add_argument("--max-seq-len", type=int, default=8192, help="byte sequence length")
+parser.add_argument("--d-state", type=int, default=64, help="SSM state dimension N")
+parser.add_argument("--headdim", type=int, default=64, help="head dimension P")
+parser.add_argument("--chunk-size", type=int, default=64, help="SSD chunk/block size Q")
 # Training
 parser.add_argument("--num-iterations", type=int, default=500, help="number of optimization steps")
 parser.add_argument("--device-batch-size", type=int, default=2, help="per-device batch size (sequences)")
@@ -32,7 +35,7 @@ parser.add_argument("--total-batch-size", type=int, default=-1, help="total batc
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="Muon LR for projection weights")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="AdamW LR for embedding")
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="AdamW LR for lm_head")
-parser.add_argument("--ssm-lr", type=float, default=0.001, help="AdamW LR for SSM params (A_log, D)")
+parser.add_argument("--ssm-lr", type=float, default=0.001, help="AdamW LR for SSM params (A_log, D, dt_bias)")
 parser.add_argument("--weight-decay", type=float, default=0.1, help="weight decay for Muon")
 parser.add_argument("--warmup-steps", type=int, default=20, help="LR warmup steps")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="fraction of training for LR warmdown")
@@ -59,14 +62,12 @@ else:
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # ─── Data ───────────────────────────────────────────────────────────────────
-# By default, loads ClimbMix-400B parquet shards (same dataset as nanochat GPT)
-# and converts text to raw bytes. Use --data for a plain text file instead.
 
 def load_climbmix_bytes(split, max_bytes, device):
     """Load ClimbMix parquet data as a flat byte tensor."""
     import numpy as np
     from nanochat.dataset import list_parquet_files, parquets_iter_batched
-    list_parquet_files(warn_on_legacy=True)  # warn if ClimbMix not found
+    list_parquet_files(warn_on_legacy=True)
     chunks = []
     total = 0
     for texts in parquets_iter_batched(split):
@@ -99,13 +100,11 @@ def get_batch(split_data, batch_size, seq_len):
     y = torch.stack([split_data[i+1:i+seq_len+1] for i in ix])
     return x, y
 
-# Load data: default is ClimbMix, --data overrides with a text file
-# Load ~10x more bytes than training consumes to ensure variety in random sampling
 total_batch_size = args.total_batch_size
 if total_batch_size == -1:
     total_batch_size = args.device_batch_size * args.max_seq_len
 train_bytes_target = total_batch_size * args.num_iterations * 10
-train_bytes_target = min(max(train_bytes_target, 10_000_000), 200_000_000)  # 10MB–200MB
+train_bytes_target = min(max(train_bytes_target, 10_000_000), 200_000_000)
 val_bytes_target = min(max(train_bytes_target // 10, 1_000_000), 20_000_000)
 
 if args.data:
@@ -123,16 +122,20 @@ print0(f"Data: {len(train_bytes):,} train bytes, {len(val_bytes):,} val bytes")
 # ─── Model ──────────────────────────────────────────────────────────────────
 
 n_embd = args.depth * args.aspect_ratio
-config = Mamba1Config(
+config = Mamba2Config(
     sequence_len=args.max_seq_len,
     n_layer=args.depth,
     n_embd=n_embd,
+    d_state=args.d_state,
+    headdim=args.headdim,
+    chunk_size=args.chunk_size,
 )
-print0(f"Model: n_layer={config.n_layer}, n_embd={config.n_embd}, "
-       f"d_inner={config.d_inner}, dt_rank={config.dt_rank}, seq_len={config.sequence_len}")
+print0(f"Model: n_layer={config.n_layer}, n_embd={config.n_embd}, d_inner={config.d_inner}, "
+       f"nheads={config.nheads}, headdim={config.headdim}, d_state={config.d_state}, "
+       f"chunk_size={config.chunk_size}")
 
 with torch.device("meta"):
-    model = Mamba1(config)
+    model = Mamba2(config)
 
 model.to_empty(device=device)
 model.init_weights()
@@ -161,7 +164,6 @@ model = torch.compile(model, dynamic=False)
 
 # ─── Batch / grad accum ────────────────────────────────────────────────────
 
-# total_batch_size already computed above in data loading section
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len
 assert total_batch_size % tokens_per_fwdbwd == 0
 grad_accum_steps = total_batch_size // tokens_per_fwdbwd
@@ -212,7 +214,6 @@ total_training_time = 0
 for step in range(num_iterations + 1):
     last_step = step == num_iterations
 
-    # Periodic validation
     if args.val_every > 0 and (last_step or step % args.val_every == 0):
         val_loss, val_bpb = validate(model)
         print0(f"  EVAL | val_loss={val_loss:.4f} val_bpb={val_bpb:.4f}")
@@ -220,7 +221,6 @@ for step in range(num_iterations + 1):
     if last_step:
         break
 
-    # ── Training step ──
     synchronize()
     t0 = time.time()
 
@@ -234,12 +234,10 @@ for step in range(num_iterations + 1):
         else:
             loss.backward()
 
-    # Update LR
     lrm = get_lr_multiplier(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
 
-    # Step optimizer
     if scaler is not None:
         scaler.step(optimizer)
         scaler.update()
@@ -252,7 +250,6 @@ for step in range(num_iterations + 1):
     t1 = time.time()
     dt = t1 - t0
 
-    # ── Logging ──
     ema = 0.9
     smooth_loss = ema * smooth_loss + (1 - ema) * train_loss_f
     debiased = smooth_loss / (1 - ema**(step + 1))
@@ -268,7 +265,6 @@ for step in range(num_iterations + 1):
     if step % args.log_every == 0 or step < 5:
         print0(f"{step:6d} {debiased:8.4f} {bpb:8.4f} {dt*1000:8.1f} {tok_per_sec:10,} {mfu:6.2f}")
 
-    # GC
     if step == 0:
         gc.collect()
         gc.disable()
