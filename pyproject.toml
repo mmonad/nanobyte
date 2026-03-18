@@ -1,5 +1,5 @@
 [project]
-name = "nanochat"
+name = "nanobyte"
 version = "0.1.0"
 description = "the minimal full-stack ChatGPT clone"
 readme = "README.md"
@@ -21,7 +21,7 @@ dependencies = [
     "torch>=2.9.1",
     "transformers>=4.57.3",
     "uvicorn>=0.36.0",
-    "wandb>=0.21.3",
+    "wandb>=0.24.1,<0.25",
     "zstandard>=0.25.0",
 ]
 
