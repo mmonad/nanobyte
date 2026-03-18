@@ -13,7 +13,6 @@ import gc
 import argparse
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda/bin/ptxas")
 import time
 import wandb
 import torch
@@ -22,6 +21,7 @@ from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
+from nanochat.flash_attention import ATTENTION_BACKEND, HAS_FA3
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
 
@@ -88,10 +88,16 @@ else:
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
+# Flash Attention status
+if ATTENTION_BACKEND == "fa3":
+    print0("Using Flash Attention 3.")
+elif ATTENTION_BACKEND == "flex":
+    print0("Using PyTorch FlexAttention on ROCm.")
+elif not HAS_FA3:
+    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
+
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
-if device.type == "cuda":
-    model.create_block_masks(device)
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})

@@ -13,7 +13,6 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda/bin/ptxas")
 import gc
 import json
 import time
@@ -33,6 +32,7 @@ from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
+from nanochat.flash_attention import ATTENTION_BACKEND, HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
 
@@ -99,8 +99,23 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
-# Attention: flex_attention for training, SDPA for inference
-print0("Using flex_attention for training (sliding window via block masks)")
+# Flash Attention status
+backend = ATTENTION_BACKEND
+if backend == "fa3":
+    print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+elif backend == "flex":
+    print0("✓ Using PyTorch FlexAttention (compiled). Sliding-window attention supported.")
+else:
+    print0("!" * 80)
+    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
+        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
+    else:
+        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
+    print0("WARNING: Training will be less efficient without FA3")
+    if args.window_pattern != "L":
+        print0(f"Auto-overriding --window-pattern from '{args.window_pattern}' to 'L' (SDPA has no efficient sliding window support)")
+        args.window_pattern = "L"
+    print0("!" * 80)
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
@@ -115,7 +130,7 @@ print0(f"Vocab size: {vocab_size:,}")
 def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (head_dim must be divisible by 8 for tensor cores, and this guarantees head_dim == args.head_dim exactly)
+    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
@@ -135,8 +150,6 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
-if device_type == "cuda":
-    model.create_block_masks(device) # 4) Precompute flex_attention block masks for training
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -355,11 +368,18 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
-# Momentum scheduler for Muon optimizer (warms up to 0.97 over the first 400 steps)
+# Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
-    frac = min(it / 400, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.97
-    return momentum
+    warmdown_iters = round(args.warmdown_ratio * num_iterations)
+    warmdown_start = num_iterations - warmdown_iters
+    if it < 400:
+        frac = it / 400
+        return (1 - frac) * 0.85 + frac * 0.97
+    elif it >= warmdown_start:
+        progress = (it - warmdown_start) / warmdown_iters
+        return 0.97 * (1 - progress) + 0.90 * progress
+    else:
+        return 0.97
 
 # Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
 def get_weight_decay(it):
